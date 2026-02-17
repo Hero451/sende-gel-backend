@@ -1,6 +1,5 @@
 import express from "express";
 import cors from "cors";
-import dotenv from "dotenv";
 import { PrismaClient } from "@prisma/client";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -9,8 +8,6 @@ import fs from "fs";
 import multer from "multer";
 import bcrypt from "bcrypt";
 import nodemailer from "nodemailer";
-
-dotenv.config();
 
 const prisma = new PrismaClient();
 const app = express();
