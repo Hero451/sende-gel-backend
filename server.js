@@ -118,11 +118,13 @@ function driverAuth(req, res, next) {
 
 const ALLOWED_RIDE_STATUS = new Set([
   "OPEN",
+  "SEARCHING",
   "ACCEPTED",
   "ARRIVING",
   "IN_PROGRESS",
   "COMPLETED",
   "CANCELED",
+  "FAILED",
 ]);
 
 /* =========================
@@ -293,37 +295,321 @@ app.post("/drivers/online", driverAuth, async (req, res) => {
 });
 
 /* =========================
+   DRIVER LIVE STATUS / LOCATION
+========================= */
+
+// Sürücü: ONLINE/BUSY/OFFLINE (Panel düğmesi buraya bağlanacak)
+app.post("/drivers/availability", driverAuth, async (req, res) => {
+  try {
+    // Eski isOnline desteği de kalsın diye:
+    const { availability, isOnline } = req.body;
+
+    // availability gelirse onu kullan
+    let nextAvailability = null;
+    if (availability) {
+      const v = String(availability).toUpperCase();
+      if (!["ONLINE", "BUSY", "OFFLINE"].includes(v)) {
+        return res.status(400).json({ ok: false, message: "availability ONLINE/BUSY/OFFLINE olmalı." });
+      }
+      nextAvailability = v;
+    }
+
+    // availability yoksa isOnline'dan çevir (geriye dönük)
+    if (!nextAvailability && typeof isOnline !== "undefined") {
+      nextAvailability = Boolean(isOnline) ? "ONLINE" : "OFFLINE";
+    }
+
+    if (!nextAvailability) {
+      return res.status(400).json({ ok: false, message: "availability veya isOnline gönder." });
+    }
+
+    const driver = await prisma.driver.update({
+      where: { id: req.driverId },
+      data: {
+        availability: nextAvailability,
+        // isOnline kolonunu da uyumlu tutalım
+        isOnline: nextAvailability === "ONLINE",
+      },
+      select: { id: true, isOnline: true, availability: true },
+    });
+
+    res.json({ ok: true, driver });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: "availability update hata", error: String(e) });
+  }
+});
+
+// Sürücü konumu güncelle (5km/10km hesabı için şart)
+app.post("/drivers/location", driverAuth, async (req, res) => {
+  try {
+    const { lat, lng } = req.body;
+    const fLat = Number(lat);
+    const fLng = Number(lng);
+    if (!Number.isFinite(fLat) || !Number.isFinite(fLng)) {
+      return res.status(400).json({ ok: false, message: "lat ve lng sayı olmalı." });
+    }
+
+    const driver = await prisma.driver.update({
+      where: { id: req.driverId },
+      data: { lat: fLat, lng: fLng },
+      select: { id: true, lat: true, lng: true, availability: true, isOnline: true },
+    });
+
+    res.json({ ok: true, driver });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: "location update hata", error: String(e) });
+  }
+});
+
+/* =========================
+   MATCHING / SEARCH ENGINE
+========================= */
+
+function toRad(x) {
+  return (x * Math.PI) / 180;
+}
+
+// KM cinsinden mesafe (Haversine)
+function distanceKm(lat1, lng1, lat2, lng2) {
+  const R = 6371;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+    Math.sin(dLng / 2) * Math.sin(dLng / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+async function expireOldOffers(rideRequestId) {
+  const now = new Date();
+  await prisma.rideOffer.updateMany({
+    where: {
+      rideRequestId,
+      status: "SENT",
+      expiresAt: { lte: now },
+    },
+    data: { status: "EXPIRED" },
+  });
+}
+
+async function createOffersForRide({ ride, radiusKm, ttlSeconds }) {
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + ttlSeconds * 1000);
+
+  // Online & müsait sürücüler: availability ONLINE veya isOnline true (geri uyum)
+  const candidates = await prisma.driver.findMany({
+    where: {
+      OR: [
+        { availability: "ONLINE" },
+        { isOnline: true },
+      ],
+    },
+    select: { id: true, lat: true, lng: true, availability: true, isOnline: true },
+  });
+
+  let chosen = candidates;
+
+  // Konum varsa yarıçap filtresi uygula
+  if (ride.pickupLat != null && ride.pickupLng != null) {
+    chosen = candidates.filter((d) => {
+      if (d.lat == null || d.lng == null) return false;
+      const km = distanceKm(ride.pickupLat, ride.pickupLng, d.lat, d.lng);
+      return km <= radiusKm;
+    });
+  }
+
+  if (chosen.length === 0) return { count: 0, expiresAt };
+
+  // Offer createMany (aynı sürücüye iki kere gitmesin diye skipDuplicates)
+  const data = chosen.map((d) => ({
+    rideRequestId: ride.id,
+    driverId: d.id,
+    status: "SENT",
+    expiresAt,
+  }));
+
+  const created = await prisma.rideOffer.createMany({
+    data,
+    skipDuplicates: true,
+  });
+
+  // RideRequest üzerinde arama bilgisi güncelle
+  await prisma.rideRequest.update({
+    where: { id: ride.id },
+    data: {
+      status: "SEARCHING",
+      searchRadiusKm: radiusKm,
+      expiresAt,
+    },
+  });
+
+  return { count: created.count, expiresAt };
+}
+
+// Faz motoru: 1) 5km 15sn, 2) 5km 7sn, 3) 10km 12sn, yoksa FAILED
+async function runRideSearch(rideRequestId) {
+  // Faz-1
+  await runPhase(rideRequestId, 1);
+}
+
+async function runPhase(rideRequestId, phase) {
+  // önce expire
+  await expireOldOffers(rideRequestId);
+
+  const ride = await prisma.rideRequest.findUnique({
+    where: { id: rideRequestId },
+    select: { id: true, status: true, driverId: true, pickupLat: true, pickupLng: true, phase: true },
+  });
+
+  if (!ride) return;
+
+  // zaten bitti mi?
+  if (ride.driverId || ["ACCEPTED", "ARRIVING", "IN_PROGRESS", "COMPLETED", "CANCELED", "FAILED"].includes(ride.status)) {
+    return;
+  }
+
+  let radiusKm = 5;
+  let ttlSeconds = 15;
+
+  if (phase === 1) { radiusKm = 5; ttlSeconds = 15; }
+  if (phase === 2) { radiusKm = 5; ttlSeconds = 7; }
+  if (phase === 3) { radiusKm = 10; ttlSeconds = 12; }
+
+  // Ride üzerinde phase yaz
+  await prisma.rideRequest.update({
+    where: { id: rideRequestId },
+    data: { phase },
+  });
+
+  // Offers oluştur
+  const { count, expiresAt } = await createOffersForRide({
+    ride: { ...ride, pickupLat: ride.pickupLat, pickupLng: ride.pickupLng, id: ride.id },
+    radiusKm,
+    ttlSeconds,
+  });
+
+  // Hiç sürücü yoksa direkt bir sonraki faza geç / veya fail
+  if (count === 0) {
+    if (phase < 3) return runPhase(rideRequestId, phase + 1);
+
+    await prisma.rideRequest.update({
+      where: { id: rideRequestId },
+      data: { status: "FAILED", expiresAt: null },
+    });
+    return;
+  }
+
+  // Süre bitince kontrol et
+  setTimeout(async () => {
+    try {
+      await expireOldOffers(rideRequestId);
+
+      const latest = await prisma.rideRequest.findUnique({
+        where: { id: rideRequestId },
+        select: { id: true, status: true, driverId: true },
+      });
+
+      if (!latest) return;
+      if (latest.driverId || ["ACCEPTED", "ARRIVING", "IN_PROGRESS", "COMPLETED", "CANCELED"].includes(latest.status)) return;
+
+      if (phase < 3) {
+        await runPhase(rideRequestId, phase + 1);
+      } else {
+        await prisma.rideRequest.update({
+          where: { id: rideRequestId },
+          data: { status: "FAILED", expiresAt: null },
+        });
+      }
+    } catch (err) {
+      console.error("phase timeout error:", err);
+    }
+  }, ttlSeconds * 1000);
+}
+
+/* =========================
    RIDES (CUSTOMER)
 ========================= */
+
 app.post("/rides/create", auth, async (req, res) => {
   try {
-    const { pickupText, dropoffText } = req.body;
+    const { pickupText, pickupLat, pickupLng, dropoffText, dropoffLat, dropoffLng } = req.body;
+
     if (!pickupText) {
       return res.status(400).json({ ok: false, message: "pickupText gerekli." });
     }
 
-    // ✅ 1) Online sürücü yoksa anında "Uygun araç bulunamadı"
-    const onlineDriver = await prisma.driver.findFirst({
-      where: { isOnline: true },
-      select: { id: true },
-    });
+    // Lat/Lng opsiyonel ama varsa sayı olmalı
+    const pLat = pickupLat == null ? null : Number(pickupLat);
+    const pLng = pickupLng == null ? null : Number(pickupLng);
+    if ((pLat != null && !Number.isFinite(pLat)) || (pLng != null && !Number.isFinite(pLng))) {
+      return res.status(400).json({ ok: false, message: "pickupLat/pickupLng sayı olmalı." });
+    }
 
-    if (!onlineDriver) {
-      return res.json({ ok: false, message: "Uygun araç bulunamadı." });
+    const dLat = dropoffLat == null ? null : Number(dropoffLat);
+    const dLng = dropoffLng == null ? null : Number(dropoffLng);
+    if ((dLat != null && !Number.isFinite(dLat)) || (dLng != null && !Number.isFinite(dLng))) {
+      return res.status(400).json({ ok: false, message: "dropoffLat/dropoffLng sayı olmalı." });
     }
 
     const ride = await prisma.rideRequest.create({
       data: {
         customerId: req.userId,
         pickupText,
+        pickupLat: pLat,
+        pickupLng: pLng,
         dropoffText: dropoffText || null,
-        status: "OPEN",
+        dropoffLat: dLat,
+        dropoffLng: dLng,
+        status: "SEARCHING",
+        phase: 1,
+        searchRadiusKm: 5,
+      },
+      select: {
+        id: true,
+        status: true,
+        phase: true,
+        searchRadiusKm: true,
+        expiresAt: true,
+        createdAt: true,
       },
     });
 
-    res.json({ ok: true, ride });
+    // Aramayı başlat (asenkron)
+    runRideSearch(ride.id).catch((err) => console.error("runRideSearch error:", err));
+
+    res.json({
+      ok: true,
+      message: "Taksi çağrısı başlatıldı.",
+      ride,
+    });
   } catch (e) {
     res.status(500).json({ ok: false, message: "Ride create hata", error: String(e) });
+  }
+});
+
+// Müşteri: ride durumunu takip
+app.get("/rides/status/:id", auth, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ ok: false, message: "Geçersiz ride id" });
+    }
+
+    const ride = await prisma.rideRequest.findUnique({
+      where: { id },
+      include: {
+        driver: { select: { id: true, name: true, phone: true, availability: true, isOnline: true } },
+      },
+    });
+
+    if (!ride) return res.status(404).json({ ok: false, message: "Ride bulunamadı" });
+    if (ride.customerId !== req.userId) return res.status(403).json({ ok: false, message: "Bu ride sana ait değil" });
+
+    res.json({ ok: true, ride });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: "Ride status hata", error: String(e) });
   }
 });
 
@@ -340,89 +626,143 @@ app.get("/rides/my", auth, async (req, res) => {
   }
 });
 
-// ✅ 2) 20 saniye içinde kimse kabul etmezse "Uygun araç bulunamadı"
-app.get("/rides/:id", auth, async (req, res) => {
+/* =========================
+   OFFERS (DRIVER)
+========================= */
+
+// Sürücüye gelen aktif çağrılar
+app.get("/drivers/offers", driverAuth, async (req, res) => {
   try {
-    const id = Number(req.params.id);
-    if (!Number.isFinite(id)) {
-      return res.status(400).json({ ok: false, message: "Geçersiz ride id" });
-    }
+    const now = new Date();
 
-    const ride = await prisma.rideRequest.findUnique({ where: { id } });
-    if (!ride) {
-      return res.status(404).json({ ok: false, message: "Ride bulunamadı" });
-    }
+    await prisma.rideOffer.updateMany({
+      where: { driverId: req.driverId, status: "SENT", expiresAt: { lte: now } },
+      data: { status: "EXPIRED" },
+    });
 
-    if (ride.customerId !== req.userId) {
-      return res.status(403).json({ ok: false, message: "Bu ride sana ait değil" });
-    }
+    const offers = await prisma.rideOffer.findMany({
+      where: {
+        driverId: req.driverId,
+        status: "SENT",
+        expiresAt: { gt: now },
+      },
+      orderBy: { sentAt: "desc" },
+      include: {
+        rideRequest: {
+          select: {
+            id: true,
+            pickupText: true,
+            dropoffText: true,
+            status: true,
+            phase: true,
+            searchRadiusKm: true,
+            expiresAt: true,
+            createdAt: true,
+          },
+        },
+      },
+      take: 20,
+    });
 
-    const now = Date.now();
-    const created = new Date(ride.createdAt).getTime();
-    const ageSeconds = (now - created) / 1000;
-
-    // ⏱ 20sn: ACCEPTED olmazsa CANCEL
-    if (ride.status === "OPEN" && ageSeconds > 20) {
-      const updated = await prisma.rideRequest.update({
-        where: { id },
-        data: { status: "CANCELED" },
-      });
-
-      return res.json({
-        ok: false,
-        message: "Uygun araç bulunamadı.",
-        ride: updated,
-      });
-    }
-
-    return res.json({ ok: true, ride });
+    res.json({ ok: true, offers });
   } catch (e) {
-    res.status(500).json({ ok: false, message: "Ride get hata", error: String(e) });
+    res.status(500).json({ ok: false, message: "Offers hata", error: String(e) });
+  }
+});
+
+// Sürücü çağrıyı kabul et
+app.post("/drivers/offers/:offerId/accept", driverAuth, async (req, res) => {
+  try {
+    const offerId = Number(req.params.offerId);
+    if (!Number.isFinite(offerId)) {
+      return res.status(400).json({ ok: false, message: "offerId geçersiz" });
+    }
+
+    const now = new Date();
+
+    const result = await prisma.$transaction(async (tx) => {
+      const offer = await tx.rideOffer.findFirst({
+        where: { id: offerId, driverId: req.driverId },
+        include: { rideRequest: true },
+      });
+
+      if (!offer) return { ok: false, code: 404, message: "Offer bulunamadı" };
+
+      if (offer.status !== "SENT") return { ok: false, code: 409, message: "Offer artık geçerli değil." };
+      if (offer.expiresAt <= now) {
+        await tx.rideOffer.update({ where: { id: offerId }, data: { status: "EXPIRED" } });
+        return { ok: false, code: 409, message: "Offer süresi dolmuş." };
+      }
+
+      const ride = await tx.rideRequest.findUnique({ where: { id: offer.rideRequestId } });
+      if (!ride) return { ok: false, code: 404, message: "Ride yok" };
+
+      if (ride.driverId) return { ok: false, code: 409, message: "Çağrı zaten alınmış." };
+      if (["FAILED", "CANCELED", "COMPLETED"].includes(ride.status)) {
+        return { ok: false, code: 409, message: "Çağrı artık geçerli değil." };
+      }
+
+      // Ride'ı ata
+      await tx.rideRequest.update({
+        where: { id: ride.id },
+        data: { driverId: req.driverId, status: "ACCEPTED", expiresAt: null },
+      });
+
+      // Bu offer ACCEPTED
+      await tx.rideOffer.update({
+        where: { id: offerId },
+        data: { status: "ACCEPTED", acceptedAt: now },
+      });
+
+      // Diğer SENT offer'ları EXPIRED yap
+      await tx.rideOffer.updateMany({
+        where: { rideRequestId: ride.id, status: "SENT" },
+        data: { status: "EXPIRED" },
+      });
+
+      // Sürücüyü BUSY yap (meşgul)
+      await tx.driver.update({
+        where: { id: req.driverId },
+        data: { availability: "BUSY", isOnline: true },
+      });
+
+      const updatedRide = await tx.rideRequest.findUnique({
+        where: { id: ride.id },
+        include: { customer: { select: { id: true, name: true, phone: true } } },
+      });
+
+      return { ok: true, code: 200, ride: updatedRide };
+    });
+
+    if (!result.ok) {
+      return res.status(result.code).json({ ok: false, message: result.message });
+    }
+
+    res.json({ ok: true, ride: result.ride });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: "Offer accept hata", error: String(e) });
   }
 });
 
 /* =========================
    RIDES (DRIVER)
 ========================= */
-app.get("/rides/open", driverAuth, async (req, res) => {
+
+// Sürücü: kendi aldığı ride'lar
+app.get("/rides/driver/my", driverAuth, async (req, res) => {
   try {
     const rides = await prisma.rideRequest.findMany({
-      where: { status: "OPEN" },
+      where: { driverId: req.driverId },
       orderBy: { createdAt: "desc" },
       take: 50,
     });
     res.json({ ok: true, rides });
   } catch (e) {
-    res.status(500).json({ ok: false, message: "Rides open hata", error: String(e) });
+    res.status(500).json({ ok: false, message: "Driver rides my hata", error: String(e) });
   }
 });
 
-app.post("/rides/accept", driverAuth, async (req, res) => {
-  try {
-    const { rideId } = req.body;
-    if (!rideId) return res.status(400).json({ ok: false, message: "rideId gerekli." });
-
-    const id = Number(rideId);
-    if (!Number.isFinite(id)) {
-      return res.status(400).json({ ok: false, message: "rideId sayı olmalı." });
-    }
-
-    const updated = await prisma.rideRequest.updateMany({
-      where: { id, status: "OPEN", driverId: null },
-      data: { driverId: req.driverId, status: "ACCEPTED" },
-    });
-
-    if (updated.count === 0) {
-      return res.status(409).json({ ok: false, message: "Çağrı zaten alınmış veya OPEN değil." });
-    }
-
-    const ride = await prisma.rideRequest.findUnique({ where: { id } });
-    res.json({ ok: true, ride });
-  } catch (e) {
-    res.status(500).json({ ok: false, message: "Kabul edilemedi", error: String(e) });
-  }
-});
-
+// Sürücü: ride status güncelle
 app.post("/rides/status", driverAuth, async (req, res) => {
   try {
     const { rideId, status } = req.body;
@@ -433,8 +773,7 @@ app.post("/rides/status", driverAuth, async (req, res) => {
     if (!ALLOWED_RIDE_STATUS.has(String(status))) {
       return res.status(400).json({
         ok: false,
-        message:
-          "Geçersiz status. Allowed: OPEN, ACCEPTED, ARRIVING, IN_PROGRESS, COMPLETED, CANCELED",
+        message: "Geçersiz status.",
       });
     }
 
