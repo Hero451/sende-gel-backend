@@ -19,42 +19,120 @@ model User {
   rideRequests RideRequest[]
 }
 
+/*
+  Sürücü durumu:
+  OFFLINE: çağrı almaz
+  ONLINE: çağrı alır
+  BUSY: meşgul
+*/
+enum DriverAvailability {
+  OFFLINE
+  ONLINE
+  BUSY
+}
+
+/*
+  OPEN'u kaldırmıyoruz çünkü DB'de mevcut kayıtlar var.
+*/
 enum RideStatus {
   OPEN
+  SEARCHING
   ACCEPTED
   ARRIVING
   IN_PROGRESS
   COMPLETED
   CANCELED
+  FAILED
+}
+
+/*
+  Sürücüye gönderilen teklif
+*/
+enum OfferStatus {
+  SENT
+  ACCEPTED
+  REJECTED
+  EXPIRED
 }
 
 model Driver {
-  id        Int      @id @default(autoincrement())
-  name      String?
-  phone     String   @unique
-  password  String
-  isOnline  Boolean  @default(false)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id           Int      @id @default(autoincrement())
+  name         String?
+  phone        String   @unique
+  password     String
 
-  rides RideRequest[] @relation("DriverRides")
+  // Eski alanı geçici olarak tutuyoruz
+  isOnline     Boolean  @default(false)
+
+  // Yeni sistem için
+  availability DriverAvailability @default(OFFLINE)
+
+  // Konum (şimdilik opsiyonel)
+  lat          Float?
+  lng          Float?
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  rides        RideRequest[] @relation("DriverRides")
+  offers       RideOffer[]
 }
 
 model RideRequest {
-  id         Int     @id @default(autoincrement())
-  customerId Int
-  customer   User    @relation(fields: [customerId], references: [id])
-  driverId   Int?
-  driver     Driver? @relation("DriverRides", fields: [driverId], references: [id])
+  id          Int       @id @default(autoincrement())
+
+  customerId  Int
+  customer    User      @relation(fields: [customerId], references: [id])
+
+  driverId    Int?
+  driver      Driver?   @relation("DriverRides", fields: [driverId], references: [id])
 
   pickupText  String
+
+  // ZORUNLU YAPMIYORUZ (mevcut kayıtlar var)
+  pickupLat   Float?
+  pickupLng   Float?
+
   dropoffText String?
+  dropoffLat  Float?
+  dropoffLng  Float?
+
   status      RideStatus @default(OPEN)
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  // Arama sistemi için
+  searchRadiusKm Int      @default(5)
+  phase          Int      @default(1)
+  expiresAt      DateTime?
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  offers      RideOffer[]
 
   @@index([status])
   @@index([customerId])
   @@index([driverId])
+}
+
+model RideOffer {
+  id            Int        @id @default(autoincrement())
+
+  rideRequestId Int
+  rideRequest   RideRequest @relation(fields: [rideRequestId], references: [id], onDelete: Cascade)
+
+  driverId      Int
+  driver        Driver      @relation(fields: [driverId], references: [id], onDelete: Cascade)
+
+  status        OfferStatus @default(SENT)
+
+  sentAt        DateTime    @default(now())
+  expiresAt     DateTime
+
+  acceptedAt    DateTime?
+  rejectedAt    DateTime?
+
+  @@index([driverId])
+  @@index([rideRequestId])
+  @@index([status])
+  @@unique([rideRequestId, driverId])
 }
