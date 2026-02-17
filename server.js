@@ -10,30 +10,41 @@ dotenv.config();
 const app = express();
 const prisma = new PrismaClient();
 
-const PORT = process.env.PORT || 4000;
-const JWT_SECRET = process.env.JWT_SECRET || "change_this_secret";
+const PORT = Number(process.env.PORT) || 4000;
 
-app.use(express.json());
+// ✅ Güvenlik: JWT_SECRET yoksa uyar (Render'da eklemen şart)
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.warn(
+    "⚠️ JWT_SECRET bulunamadı! Render > Environment'a JWT_SECRET eklemen gerekiyor."
+  );
+}
 
-/**
- * ✅ PRO CORS
- * - Local test: localhost ve 127.0.0.1 izinli
- * - Production: sendegelvip.com izinli
- *
- * Deploy sonrası sadece domain istersen, localhost satırlarını silersin.
- */
+// Render/Prod ortamında CORS listesi
+const ALLOWED_ORIGINS = [
+  "http://localhost:3000",
+  "http://localhost:4000",
+  "http://127.0.0.1:3000",
+  "http://127.0.0.1:4000",
+  "https://sendegelvip.com",
+  "https://www.sendegelvip.com",
+];
+
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true }));
+
 app.use(
   cors({
-    origin: [
-      "http://localhost:3000",
-      "http://localhost:4000",
-      "http://127.0.0.1:3000",
-      "http://127.0.0.1:4000",
-      "https://sendegelvip.com",
-      "https://www.sendegelvip.com",
-    ],
-    methods: ["GET", "POST"],
+    origin: function (origin, cb) {
+      // Mobil uygulamada bazen origin boş gelir (native). Buna izin veriyoruz.
+      if (!origin) return cb(null, true);
+
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(new Error("CORS blocked: " + origin), false);
+    },
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
   })
 );
 
@@ -49,6 +60,73 @@ app.get("/health", (req, res) => {
 });
 
 /* =========================
+   HELPERS
+========================= */
+function mustHaveJwtSecret(res) {
+  if (!JWT_SECRET) {
+    res.status(500).json({
+      ok: false,
+      message:
+        "JWT_SECRET eksik. Render > Environment'a JWT_SECRET ekle ve yeniden deploy et.",
+    });
+    return false;
+  }
+  return true;
+}
+
+function signToken(payload) {
+  // JWT_SECRET varlığı yukarıda kontrol ediliyor
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: "7d" });
+}
+
+function auth(req, res, next) {
+  if (!mustHaveJwtSecret(res)) return;
+
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ ok: false, message: "Token yok." });
+
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    if (!payload.userId) {
+      return res.status(401).json({ ok: false, message: "Customer token değil." });
+    }
+    req.userId = payload.userId;
+    next();
+  } catch {
+    return res.status(401).json({ ok: false, message: "Token geçersiz." });
+  }
+}
+
+function driverAuth(req, res, next) {
+  if (!mustHaveJwtSecret(res)) return;
+
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ ok: false, message: "Token yok." });
+
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    if (!payload.driverId) {
+      return res.status(401).json({ ok: false, message: "Driver token değil." });
+    }
+    req.driverId = payload.driverId;
+    next();
+  } catch {
+    return res.status(401).json({ ok: false, message: "Token geçersiz." });
+  }
+}
+
+const ALLOWED_RIDE_STATUS = new Set([
+  "OPEN",
+  "ACCEPTED",
+  "ARRIVING",
+  "IN_PROGRESS",
+  "COMPLETED",
+  "CANCELED",
+]);
+
+/* =========================
    CUSTOMER AUTH
 ========================= */
 app.post("/auth/register", async (req, res) => {
@@ -56,7 +134,9 @@ app.post("/auth/register", async (req, res) => {
     const { name, phone, email, password } = req.body;
 
     if (!password || (!phone && !email)) {
-      return res.status(400).json({ ok: false, message: "Telefon veya email ve şifre gerekli." });
+      return res
+        .status(400)
+        .json({ ok: false, message: "Telefon veya email ve şifre gerekli." });
     }
 
     const existing = await prisma.user.findFirst({
@@ -72,7 +152,12 @@ app.post("/auth/register", async (req, res) => {
     const hashed = await bcrypt.hash(password, 10);
 
     const user = await prisma.user.create({
-      data: { name: name || null, phone: phone || null, email: email || null, password: hashed },
+      data: {
+        name: name || null,
+        phone: phone || null,
+        email: email || null,
+        password: hashed,
+      },
       select: { id: true, name: true, phone: true, email: true, createdAt: true },
     });
 
@@ -84,10 +169,14 @@ app.post("/auth/register", async (req, res) => {
 
 app.post("/auth/login", async (req, res) => {
   try {
+    if (!mustHaveJwtSecret(res)) return;
+
     const { phone, email, password } = req.body;
 
     if (!password || (!phone && !email)) {
-      return res.status(400).json({ ok: false, message: "Telefon veya email ve şifre gerekli." });
+      return res
+        .status(400)
+        .json({ ok: false, message: "Telefon veya email ve şifre gerekli." });
     }
 
     const user = await prisma.user.findFirst({
@@ -101,7 +190,7 @@ app.post("/auth/login", async (req, res) => {
     const valid = await bcrypt.compare(password, user.password);
     if (!valid) return res.status(401).json({ ok: false, message: "Şifre yanlış." });
 
-    const token = jwt.sign({ userId: user.id, role: "customer" }, JWT_SECRET, { expiresIn: "7d" });
+    const token = signToken({ userId: user.id, role: "customer" });
 
     res.json({
       ok: true,
@@ -113,29 +202,16 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
-function auth(req, res, next) {
-  const header = req.headers.authorization || "";
-  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
-
-  if (!token) return res.status(401).json({ ok: false, message: "Token yok." });
-
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    if (!payload.userId) return res.status(401).json({ ok: false, message: "Customer token değil." });
-    req.userId = payload.userId;
-    next();
-  } catch {
-    return res.status(401).json({ ok: false, message: "Token geçersiz." });
-  }
-}
-
 app.get("/me", auth, async (req, res) => {
-  const user = await prisma.user.findUnique({
-    where: { id: req.userId },
-    select: { id: true, name: true, phone: true, email: true, createdAt: true },
-  });
-
-  res.json({ ok: true, user });
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.userId },
+      select: { id: true, name: true, phone: true, email: true, createdAt: true },
+    });
+    res.json({ ok: true, user });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: "Me hata", error: String(e) });
+  }
 });
 
 /* =========================
@@ -166,6 +242,8 @@ app.post("/drivers/register", async (req, res) => {
 
 app.post("/drivers/login", async (req, res) => {
   try {
+    if (!mustHaveJwtSecret(res)) return;
+
     const { phone, password } = req.body;
     if (!phone || !password) {
       return res.status(400).json({ ok: false, message: "Telefon ve şifre gerekli." });
@@ -177,7 +255,7 @@ app.post("/drivers/login", async (req, res) => {
     const ok = await bcrypt.compare(password, driver.password);
     if (!ok) return res.status(401).json({ ok: false, message: "Şifre yanlış." });
 
-    const token = jwt.sign({ driverId: driver.id, role: "driver" }, JWT_SECRET, { expiresIn: "7d" });
+    const token = signToken({ driverId: driver.id, role: "driver" });
 
     res.json({
       ok: true,
@@ -189,37 +267,30 @@ app.post("/drivers/login", async (req, res) => {
   }
 });
 
-function driverAuth(req, res, next) {
-  const header = req.headers.authorization || "";
-  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ ok: false, message: "Token yok." });
-
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    if (!payload.driverId) return res.status(401).json({ ok: false, message: "Driver token değil." });
-    req.driverId = payload.driverId;
-    next();
-  } catch {
-    return res.status(401).json({ ok: false, message: "Token geçersiz." });
-  }
-}
-
 app.get("/drivers/me", driverAuth, async (req, res) => {
-  const driver = await prisma.driver.findUnique({
-    where: { id: req.driverId },
-    select: { id: true, name: true, phone: true, isOnline: true, createdAt: true },
-  });
-  res.json({ ok: true, driver });
+  try {
+    const driver = await prisma.driver.findUnique({
+      where: { id: req.driverId },
+      select: { id: true, name: true, phone: true, isOnline: true, createdAt: true },
+    });
+    res.json({ ok: true, driver });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: "Driver me hata", error: String(e) });
+  }
 });
 
 app.post("/drivers/online", driverAuth, async (req, res) => {
-  const { isOnline } = req.body;
-  const driver = await prisma.driver.update({
-    where: { id: req.driverId },
-    data: { isOnline: Boolean(isOnline) },
-    select: { id: true, isOnline: true },
-  });
-  res.json({ ok: true, driver });
+  try {
+    const { isOnline } = req.body;
+    const driver = await prisma.driver.update({
+      where: { id: req.driverId },
+      data: { isOnline: Boolean(isOnline) },
+      select: { id: true, isOnline: true },
+    });
+    res.json({ ok: true, driver });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: "Online update hata", error: String(e) });
+  }
 });
 
 /* =========================
@@ -246,24 +317,32 @@ app.post("/rides/create", auth, async (req, res) => {
 });
 
 app.get("/rides/my", auth, async (req, res) => {
-  const rides = await prisma.rideRequest.findMany({
-    where: { customerId: req.userId },
-    orderBy: { createdAt: "desc" },
-    take: 50,
-  });
-  res.json({ ok: true, rides });
+  try {
+    const rides = await prisma.rideRequest.findMany({
+      where: { customerId: req.userId },
+      orderBy: { createdAt: "desc" },
+      take: 50,
+    });
+    res.json({ ok: true, rides });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: "Rides my hata", error: String(e) });
+  }
 });
 
 /* =========================
    RIDES (DRIVER)
 ========================= */
 app.get("/rides/open", driverAuth, async (req, res) => {
-  const rides = await prisma.rideRequest.findMany({
-    where: { status: "OPEN" },
-    orderBy: { createdAt: "desc" },
-    take: 50,
-  });
-  res.json({ ok: true, rides });
+  try {
+    const rides = await prisma.rideRequest.findMany({
+      where: { status: "OPEN" },
+      orderBy: { createdAt: "desc" },
+      take: 50,
+    });
+    res.json({ ok: true, rides });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: "Rides open hata", error: String(e) });
+  }
 });
 
 app.post("/rides/accept", driverAuth, async (req, res) => {
@@ -272,6 +351,9 @@ app.post("/rides/accept", driverAuth, async (req, res) => {
     if (!rideId) return res.status(400).json({ ok: false, message: "rideId gerekli." });
 
     const id = Number(rideId);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ ok: false, message: "rideId sayı olmalı." });
+    }
 
     const updated = await prisma.rideRequest.updateMany({
       where: { id, status: "OPEN", driverId: null },
@@ -289,9 +371,6 @@ app.post("/rides/accept", driverAuth, async (req, res) => {
   }
 });
 
-/**
- * ✅ PRO GÜVENLİK: Driver sadece kendi aldığı ride'ı status değiştirebilir
- */
 app.post("/rides/status", driverAuth, async (req, res) => {
   try {
     const { rideId, status } = req.body;
@@ -299,11 +378,22 @@ app.post("/rides/status", driverAuth, async (req, res) => {
       return res.status(400).json({ ok: false, message: "rideId ve status gerekli." });
     }
 
+    if (!ALLOWED_RIDE_STATUS.has(String(status))) {
+      return res.status(400).json({
+        ok: false,
+        message:
+          "Geçersiz status. Allowed: OPEN, ACCEPTED, ARRIVING, IN_PROGRESS, COMPLETED, CANCELED",
+      });
+    }
+
     const id = Number(rideId);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ ok: false, message: "rideId sayı olmalı." });
+    }
 
     const updated = await prisma.rideRequest.updateMany({
       where: { id, driverId: req.driverId },
-      data: { status },
+      data: { status: String(status) },
     });
 
     if (updated.count === 0) {
@@ -318,11 +408,37 @@ app.post("/rides/status", driverAuth, async (req, res) => {
 });
 
 /* =========================
+   404 + ERROR HANDLERS
+========================= */
+app.use((req, res) => {
+  res.status(404).json({ ok: false, message: "Route bulunamadı", path: req.path });
+});
+
+app.use((err, req, res, next) => {
+  res.status(500).json({ ok: false, message: "Server error", error: String(err?.message || err) });
+});
+
+/* =========================
    START
 ========================= */
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Backend running on port ${PORT}`);
 });
+
+// Render restart/shutdown sırasında Prisma'yı temiz kapat
+async function shutdown(signal) {
+  try {
+    console.log(`🔻 ${signal} received, shutting down...`);
+    await prisma.$disconnect();
+  } catch (e) {
+    console.error("Shutdown error:", e);
+  } finally {
+    process.exit(0);
+  }
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 process.on("uncaughtException", (err) => {
   console.error("🔥 uncaughtException:", err);
@@ -331,4 +447,3 @@ process.on("uncaughtException", (err) => {
 process.on("unhandledRejection", (reason) => {
   console.error("🔥 unhandledRejection:", reason);
 });
-
