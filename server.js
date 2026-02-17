@@ -75,7 +75,6 @@ function mustHaveJwtSecret(res) {
 }
 
 function signToken(payload) {
-  // JWT_SECRET varlığı yukarıda kontrol ediliyor
   return jwt.sign(payload, JWT_SECRET, { expiresIn: "7d" });
 }
 
@@ -299,7 +298,19 @@ app.post("/drivers/online", driverAuth, async (req, res) => {
 app.post("/rides/create", auth, async (req, res) => {
   try {
     const { pickupText, dropoffText } = req.body;
-    if (!pickupText) return res.status(400).json({ ok: false, message: "pickupText gerekli." });
+    if (!pickupText) {
+      return res.status(400).json({ ok: false, message: "pickupText gerekli." });
+    }
+
+    // ✅ 1) Online sürücü yoksa anında "Uygun araç bulunamadı"
+    const onlineDriver = await prisma.driver.findFirst({
+      where: { isOnline: true },
+      select: { id: true },
+    });
+
+    if (!onlineDriver) {
+      return res.json({ ok: false, message: "Uygun araç bulunamadı." });
+    }
 
     const ride = await prisma.rideRequest.create({
       data: {
@@ -326,6 +337,47 @@ app.get("/rides/my", auth, async (req, res) => {
     res.json({ ok: true, rides });
   } catch (e) {
     res.status(500).json({ ok: false, message: "Rides my hata", error: String(e) });
+  }
+});
+
+// ✅ 2) 20 saniye içinde kimse kabul etmezse "Uygun araç bulunamadı"
+app.get("/rides/:id", auth, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ ok: false, message: "Geçersiz ride id" });
+    }
+
+    const ride = await prisma.rideRequest.findUnique({ where: { id } });
+    if (!ride) {
+      return res.status(404).json({ ok: false, message: "Ride bulunamadı" });
+    }
+
+    if (ride.customerId !== req.userId) {
+      return res.status(403).json({ ok: false, message: "Bu ride sana ait değil" });
+    }
+
+    const now = Date.now();
+    const created = new Date(ride.createdAt).getTime();
+    const ageSeconds = (now - created) / 1000;
+
+    // ⏱ 20sn: ACCEPTED olmazsa CANCEL
+    if (ride.status === "OPEN" && ageSeconds > 20) {
+      const updated = await prisma.rideRequest.update({
+        where: { id },
+        data: { status: "CANCELED" },
+      });
+
+      return res.json({
+        ok: false,
+        message: "Uygun araç bulunamadı.",
+        ride: updated,
+      });
+    }
+
+    return res.json({ ok: true, ride });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: "Ride get hata", error: String(e) });
   }
 });
 
